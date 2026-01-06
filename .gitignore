@@ -1,0 +1,6 @@
+/headless_person.png
+/person.png
+venv311/
+__pycache__/
+*.pyc
+.env
