@@ -1,64 +1,125 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import torch
+import os  # フォルダ操作用に追加
+from iopaint.model.lama import LaMa
+from iopaint.schema import InpaintRequest, HDStrategy
 
-mp_face_mesh = mp.solutions.face_mesh
+# --- 設定 ---
+INPUT_DIR = "input"
+OUTPUT_DIR = "output"
+os.makedirs(INPUT_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-img = cv2.imread('person.png')
-if img is None:
-    print("Error: person.png が読み込めません。")
-    exit()
+# 1. モデルのロード
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = LaMa(device)
 
-h, w, _ = img.shape
-result = img.copy()
+# 目のインデックス
+LEFT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
+RIGHT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
 
-with mp_face_mesh.FaceMesh(static_image_mode=True, max_num_faces=5, refine_landmarks=True) as face_mesh:
-    results = face_mesh.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+def get_masks(img):
+    h, w, _ = img.shape
+    mp_selfie = mp.solutions.selfie_segmentation
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_face_det = mp.solutions.face_detection
 
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            # 顔全体の範囲を把握するために全ランドマークの最小/最大座標を取得
-            all_x = [lm.x * w for lm in face_landmarks.landmark]
-            all_y = [lm.y * h for lm in face_landmarks.landmark]
-            
-            x_min, x_max = int(min(all_x)), int(max(all_x))
-            y_min, y_max = int(min(all_y)), int(max(all_y))
-            
-            face_w = x_max - x_min
-            face_h = y_max - y_min
-            
-            # --- マスク範囲の強制拡張 (耳と頭頂部を飲み込む) ---
-            # 左右に顔幅の30%ずつ広げる (これで耳をカバー)
-            x_start = max(0, x_min - int(face_w * 0.3))
-            x_end = min(w - 1, x_max + int(face_w * 0.3))
-            
-            # 上に顔高の80%広げる (これで髪の毛と頭頂部をカバー)
-            y_start = max(0, y_min - int(face_h * 0.8))
-            
-            # 下（カットライン）: 顎の少し下、首の付け根あたりでスパッと切る
-            # ここを y_max + (高さの10%) 程度に固定
-            y_cut = min(h - 1, y_max + int(face_h * 0.1))
-
-            # --- 背景引き伸ばしによる塗りつぶし ---
-            for y_line in range(y_start, y_cut + 1):
-                # マスク範囲の「さらに外側」から背景色を取得
-                # 左右に10ピクセルほど余裕を持たせた地点の色を使う
-                bg_x_left = max(0, x_start - 10)
-                bg_x_right = min(w - 1, x_end + 10)
-                
-                color_left = img[y_line, bg_x_left]
-                color_right = img[y_line, bg_x_right]
-                
-                # 指定範囲を横方向に塗りつぶす
-                for x_pos in range(x_start, x_end + 1):
-                    # 左右の背景色を滑らかにブレンド
-                    weight = (x_pos - x_start) / (x_end - x_start + 1)
-                    mixed_color = color_left * (1 - weight) + color_right * weight
-                    result[y_line, x_pos] = mixed_color.astype(np.uint8)
-
-        cv2.imwrite('headless_person.png', result)
-        print("成功: 耳と頭部を完全に消去し、背景で上書きしました。")
-    else:
-        print("顔が検出されませんでした。")
-
+    with mp_selfie.SelfieSegmentation(model_selection=1) as selfie_seg, \
+         mp_face_mesh.FaceMesh(refine_landmarks=True) as face_mesh, \
+         mp_face_det.FaceDetection(model_selection=1) as face_det:
         
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        res_seg = selfie_seg.process(img_rgb)
+        res_mesh = face_mesh.process(img_rgb)
+        res_det = face_det.process(img_rgb)
+        
+        person_mask = (res_seg.segmentation_mask > 0.5).astype(np.uint8) * 255
+        full_head_mask = np.zeros((h, w), dtype=np.uint8)
+        eye_only_mask = np.zeros((h, w), dtype=np.uint8)
+
+        if res_det.detections and res_mesh.multi_face_landmarks:
+            for face_landmarks, detection in zip(res_mesh.multi_face_landmarks, res_det.detections):
+                bbox = detection.location_data.relative_bounding_box
+                
+                fx = int(bbox.xmin * w)
+                fw = int(bbox.width * w)
+                fh = int(bbox.height * h)
+                y_cut = int(bbox.ymin * h) + fh + int(fh * 0.1)
+
+                # 耳と輪郭を確実に消すための拡張設定
+                x_start = max(0, fx - int(fw * 0.8))
+                x_end = min(w - 1, fx + fw + int(fw * 0.8))
+
+                temp_head = np.zeros((h, w), dtype=np.uint8)
+                temp_head[:y_cut, x_start:x_end] = person_mask[:y_cut, x_start:x_end]
+                
+                # 輪郭の消し残し防止のための膨張
+                kernel = np.ones((7, 7), np.uint8)
+                temp_head = cv2.dilate(temp_head, kernel, iterations=2)
+                cv2.circle(temp_head, (int((bbox.xmin + bbox.width/2)*w), y_cut), int(fh*0.2), 255, -1)
+                temp_head[y_cut:, :] = 0
+                
+                full_head_mask = cv2.bitwise_or(full_head_mask, temp_head)
+
+                for eye_indices in [LEFT_EYE, RIGHT_EYE]:
+                    pts = np.array([[int(face_landmarks.landmark[i].x * w), int(face_landmarks.landmark[i].y * h)] for i in eye_indices])
+                    cv2.fillPoly(eye_only_mask, [pts], 255)
+                eye_only_mask = cv2.dilate(eye_only_mask, np.ones((3,3), np.uint8), iterations=1)
+
+            return full_head_mask, eye_only_mask, True
+    return None, None, False
+
+# --- メイン処理ループ ---
+image_extensions = (".png", ".jpg", ".jpeg", ".webp")
+files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(image_extensions)]
+
+if not files:
+    print(f"'{INPUT_DIR}' フォルダに画像を入れてから実行してください。")
+
+for filename in files:
+    input_path = os.path.join(INPUT_DIR, filename)
+    
+    # 修正: 日本語パスにも対応した堅牢な読み込み方法
+    # cv2.imread(input_path) の代わりにこちらを使用
+    file_bytes = np.fromfile(input_path, np.uint8)
+    img_original = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    
+    # ガード処理: 読み込みに失敗した場合はスキップ
+    if img_original is None:
+        print(f"警告: {filename} を画像として読み込めませんでした。スキップします。")
+        continue
+    
+    print(f"処理中: {filename}...")
+    head_mask, eye_mask, found = get_masks(img_original)
+
+    if found:
+        # 2. LaMa で消去
+        img_rgb = cv2.cvtColor(img_original, cv2.COLOR_BGR2RGB)
+        config = InpaintRequest(hd_strategy=HDStrategy.ORIGINAL)
+        res_lama = model(img_rgb, head_mask, config)
+        
+        # 型変換と正規化
+        if res_lama.max() <= 1.0: res_lama = res_lama * 255
+        bg_img = np.clip(res_lama, 0, 255).astype(np.uint8)
+
+        # 3. 高画質を維持する合成（顔なし）
+        keep_body_mask = cv2.bitwise_not(head_mask)
+        headless_img = bg_img.copy()
+        headless_img[keep_body_mask == 255] = img_original[keep_body_mask == 255]
+        
+        # 保存
+        name, ext = os.path.splitext(filename)
+        cv2.imwrite(os.path.join(OUTPUT_DIR, f"{name}_headless{ext}"), headless_img)
+
+        # 4. 目の部分だけを上書き（目あり）
+        floating_eyes_img = headless_img.copy()
+        floating_eyes_img[eye_mask == 255] = img_original[eye_mask == 255]
+        cv2.imwrite(os.path.join(OUTPUT_DIR, f"{name}_eyes{ext}"), floating_eyes_img)
+
+        print(f"完了: {filename}")
+    else:
+        print(f"スキップ: {filename} (顔が検出されませんでした)")
+
+print("\nすべての処理が終了しました。outputフォルダを確認してください。")
