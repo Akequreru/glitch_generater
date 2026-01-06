@@ -48,14 +48,12 @@ def get_masks(img):
                 fh = int(bbox.height * h)
                 y_cut = int(bbox.ymin * h) + fh + int(fh * 0.1)
 
-                # 耳と輪郭を確実に消すための拡張設定
                 x_start = max(0, fx - int(fw * 0.8))
                 x_end = min(w - 1, fx + fw + int(fw * 0.8))
 
                 temp_head = np.zeros((h, w), dtype=np.uint8)
                 temp_head[:y_cut, x_start:x_end] = person_mask[:y_cut, x_start:x_end]
                 
-                # 輪郭の消し残し防止のための膨張
                 kernel = np.ones((7, 7), np.uint8)
                 temp_head = cv2.dilate(temp_head, kernel, iterations=2)
                 cv2.circle(temp_head, (int((bbox.xmin + bbox.width/2)*w), y_cut), int(fh*0.2), 255, -1)
@@ -63,10 +61,30 @@ def get_masks(img):
                 
                 full_head_mask = cv2.bitwise_or(full_head_mask, temp_head)
 
-                for eye_indices in [LEFT_EYE, RIGHT_EYE]:
-                    pts = np.array([[int(face_landmarks.landmark[i].x * w), int(face_landmarks.landmark[i].y * h)] for i in eye_indices])
-                    cv2.fillPoly(eye_only_mask, [pts], 255)
-                eye_only_mask = cv2.dilate(eye_only_mask, np.ones((3,3), np.uint8), iterations=1)
+                # --- 修正: 黒目（虹彩）を中心に正円でくりぬく処理 ---
+                # 虹彩の中心: 左目(468), 右目(473)
+                # 直径計算用の端点: 左目(33, 133), 右目(362, 263)
+                eye_configs = [
+                    {'iris': 468, 'corners': (33, 133)}, # 左目
+                    {'iris': 473, 'corners': (362, 263)} # 右目
+                ]
+                
+                for config in eye_configs:
+                    # 黒目（虹彩）の中心座標を取得
+                    iris_lm = face_landmarks.landmark[config['iris']]
+                    cx, cy = int(iris_lm.x * w), int(iris_lm.y * h)
+                    
+                    # 目の端点の距離から半径を計算
+                    p1 = face_landmarks.landmark[config['corners'][0]]
+                    p2 = face_landmarks.landmark[config['corners'][1]]
+                    
+                    # ユークリッド距離で左右幅を算出
+                    # $\sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2}$
+                    dist = np.sqrt(((p2.x - p1.x) * w)**2 + ((p2.y - p1.y) * h)**2)
+                    radius = int(dist / 2)
+                    
+                    # 黒目を中心に正円を描画
+                    cv2.circle(eye_only_mask, (cx, cy), radius, 255, -1)
 
             return full_head_mask, eye_only_mask, True
     return None, None, False
