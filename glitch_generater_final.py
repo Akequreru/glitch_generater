@@ -318,8 +318,11 @@ def apply_eyelid_movement(roi, top_pts, bottom_pts, power=0.6, sigma_scale=2.0):
     scaling = 1.0 - (power * weight)
     map_y_new = center_y + delta_y * scaling
     
+    # ★修正箇所: 計算過程でfloat64になっている可能性があるため、remap前にfloat32へキャスト
+    map_x = map_x.astype(np.float32)
+    map_y_new = map_y_new.astype(np.float32)
+    
     return cv2.remap(roi, map_x, map_y_new, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101), map_x, map_y_new
-
 def apply_omni_directional_stretch(roi, contour_points, roi_offset):
     # Gen 4用: マップを返すように変更
     h, w, _ = roi.shape
