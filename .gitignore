@@ -6,4 +6,6 @@ __pycache__/
 .env
 input/*
 output/*
+texture_input/*
 output_2/*
+temp.py
