@@ -1,1 +1,5 @@
-glitch
+Mesh collapse
+Parts missing
+Face not displayed
+Texture discoloration
+Other

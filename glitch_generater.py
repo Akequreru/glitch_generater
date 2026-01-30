@@ -2,25 +2,51 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import torch
-import os  # フォルダ操作用に追加
+import os
+import random
 from iopaint.model.lama import LaMa
 from iopaint.schema import InpaintRequest, HDStrategy
 
-# --- 設定 ---
+# =========================================================
+# 1. 設定 & 定数
+# =========================================================
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
 os.makedirs(INPUT_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+FOREHEAD_EXTEND_RATIO = 0.07  # 移植: 額の拡張比率
+
 # 1. モデルのロード
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = LaMa(device)
 
-# 目のインデックス
-LEFT_EYE = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-RIGHT_EYE = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
+# =========================================================
+# 2. アノテーション・ヘルパー関数 (移植)
+# =========================================================
+def save_yolo_format(filepath, img_w, img_h, bbox_coords, class_id):
+    """
+    xmin, ymin, xmax, ymax を受け取り、指定された class_id で保存
+    """
+    xmin, ymin, xmax, ymax = bbox_coords
+    xmin, ymin = max(0, xmin), max(0, ymin)
+    xmax, ymax = min(img_w, xmax), min(img_h, ymax)
+    
+    bw, bh = xmax - xmin, ymax - ymin
+    if bw <= 0 or bh <= 0: return
 
-def get_masks(img):
+    xc = xmin + bw / 2.0
+    yc = ymin + bh / 2.0
+    n_xc, n_yc = xc / img_w, yc / img_h
+    n_bw, n_bh = bw / img_w, bh / img_h
+
+    with open(filepath, "w") as f:
+        f.write(f"{class_id} {n_xc:.6f} {n_yc:.6f} {n_bw:.6f} {n_bh:.6f}\n")
+
+# =========================================================
+# 3. マスク生成 & 座標取得ロジック
+# =========================================================
+def get_masks_and_coords(img):
     h, w, _ = img.shape
     mp_selfie = mp.solutions.selfie_segmentation
     mp_face_mesh = mp.solutions.face_mesh
@@ -38,18 +64,34 @@ def get_masks(img):
         person_mask = (res_seg.segmentation_mask > 0.5).astype(np.uint8) * 255
         full_head_mask = np.zeros((h, w), dtype=np.uint8)
         eye_only_mask = np.zeros((h, w), dtype=np.uint8)
+        
+        # アノテーション用の座標リスト
+        all_face_bboxes = []
 
         if res_det.detections and res_mesh.multi_face_landmarks:
             for face_landmarks, detection in zip(res_mesh.multi_face_landmarks, res_det.detections):
-                bbox = detection.location_data.relative_bounding_box
+                # --- 移植: アノテーション用座標計算 (Gen 7/8/9のロジック) ---
+                xs_all = [lm.x for lm in face_landmarks.landmark]
+                ys_all = [lm.y for lm in face_landmarks.landmark]
                 
-                fx = int(bbox.xmin * w)
+                f_xmin, f_xmax = int(min(xs_all) * w), int(max(xs_all) * w)
+                raw_ymin, raw_ymax = int(min(ys_all) * h), int(max(ys_all) * h)
+                f_h_raw = raw_ymax - raw_ymin
+                
+                # 額の拡張を反映
+                margin_up = int(f_h_raw * FOREHEAD_EXTEND_RATIO)
+                f_ymin = max(0, raw_ymin - margin_up)
+                f_ymax = raw_ymax
+                
+                all_face_bboxes.append((f_xmin, f_ymin, f_xmax, f_ymax))
+
+                # --- LaMa用マスク作成ロジック ---
+                bbox = detection.location_data.relative_bounding_box
                 fw = int(bbox.width * w)
                 fh = int(bbox.height * h)
                 y_cut = int(bbox.ymin * h) + fh + int(fh * 0.1)
-
-                x_start = max(0, fx - int(fw * 0.8))
-                x_end = min(w - 1, fx + fw + int(fw * 0.8))
+                x_start = max(0, int(bbox.xmin * w) - int(fw * 0.8))
+                x_end = min(w - 1, int(bbox.xmin * w) + fw + int(fw * 0.8))
 
                 temp_head = np.zeros((h, w), dtype=np.uint8)
                 temp_head[:y_cut, x_start:x_end] = person_mask[:y_cut, x_start:x_end]
@@ -61,83 +103,91 @@ def get_masks(img):
                 
                 full_head_mask = cv2.bitwise_or(full_head_mask, temp_head)
 
-                # --- 修正: 黒目（虹彩）を中心に正円でくりぬく処理 ---
-                # 虹彩の中心: 左目(468), 右目(473)
-                # 直径計算用の端点: 左目(33, 133), 右目(362, 263)
-                eye_configs = [
-                    {'iris': 468, 'corners': (33, 133)}, # 左目
-                    {'iris': 473, 'corners': (362, 263)} # 右目
-                ]
-                
+                # 目（虹彩）のマスク
+                eye_configs = [{'iris': 468, 'corners': (33, 133)}, {'iris': 473, 'corners': (362, 263)}]
                 for config in eye_configs:
-                    # 黒目（虹彩）の中心座標を取得
                     iris_lm = face_landmarks.landmark[config['iris']]
                     cx, cy = int(iris_lm.x * w), int(iris_lm.y * h)
-                    
-                    # 目の端点の距離から半径を計算
-                    p1 = face_landmarks.landmark[config['corners'][0]]
-                    p2 = face_landmarks.landmark[config['corners'][1]]
-                    
-                    # ユークリッド距離で左右幅を算出
-                    # $\sqrt{(x_2 - x_1)^2 + (y_2 - y_1)^2}$
+                    p1, p2 = face_landmarks.landmark[config['corners'][0]], face_landmarks.landmark[config['corners'][1]]
                     dist = np.sqrt(((p2.x - p1.x) * w)**2 + ((p2.y - p1.y) * h)**2)
-                    radius = int(dist / 2)
-                    
-                    # 黒目を中心に正円を描画
-                    cv2.circle(eye_only_mask, (cx, cy), radius, 255, -1)
+                    cv2.circle(eye_only_mask, (cx, cy), int(dist / 2), 255, -1)
 
-            return full_head_mask, eye_only_mask, True
-    return None, None, False
+            return full_head_mask, eye_only_mask, all_face_bboxes, True
+    return None, None, None, False
 
-# --- メイン処理ループ ---
+# =========================================================
+# 4. メイン処理
+# =========================================================
 image_extensions = (".png", ".jpg", ".jpeg", ".webp")
 files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(image_extensions)]
 
-if not files:
-    print(f"'{INPUT_DIR}' フォルダに画像を入れてから実行してください。")
-
 for filename in files:
     input_path = os.path.join(INPUT_DIR, filename)
-    
-    # 修正: 日本語パスにも対応した堅牢な読み込み方法
-    # cv2.imread(input_path) の代わりにこちらを使用
     file_bytes = np.fromfile(input_path, np.uint8)
     img_original = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    
-    # ガード処理: 読み込みに失敗した場合はスキップ
-    if img_original is None:
-        print(f"警告: {filename} を画像として読み込めませんでした。スキップします。")
-        continue
+    if img_original is None: continue
     
     print(f"処理中: {filename}...")
-    head_mask, eye_mask, found = get_masks(img_original)
+    h_img, w_img, _ = img_original.shape
+    head_mask, eye_mask, bboxes, found = get_masks_and_coords(img_original)
 
     if found:
-        # 2. LaMa で消去
+        # LaMa推論
         img_rgb = cv2.cvtColor(img_original, cv2.COLOR_BGR2RGB)
-        config = InpaintRequest(hd_strategy=HDStrategy.ORIGINAL)
-        res_lama = model(img_rgb, head_mask, config)
-        
-        # 型変換と正規化
-        if res_lama.max() <= 1.0: res_lama = res_lama * 255
+        res_lama = model(img_rgb, head_mask, InpaintRequest(hd_strategy=HDStrategy.ORIGINAL))
+        if res_lama.max() <= 1.0: res_lama *= 255
         bg_img = np.clip(res_lama, 0, 255).astype(np.uint8)
 
-        # 3. 高画質を維持する合成（顔なし）
-        keep_body_mask = cv2.bitwise_not(head_mask)
+        # 共通のベース画像（顔消し）
         headless_img = bg_img.copy()
+        keep_body_mask = cv2.bitwise_not(head_mask)
         headless_img[keep_body_mask == 255] = img_original[keep_body_mask == 255]
         
-        # 保存
-        name, ext = os.path.splitext(filename)
-        cv2.imwrite(os.path.join(OUTPUT_DIR, f"{name}_headless{ext}"), headless_img)
+        base_name, ext = os.path.splitext(filename)
 
-        # 4. 目の部分だけを上書き（目あり）
-        floating_eyes_img = headless_img.copy()
-        floating_eyes_img[eye_mask == 255] = img_original[eye_mask == 255]
-        cv2.imwrite(os.path.join(OUTPUT_DIR, f"{name}_eyes{ext}"), floating_eyes_img)
+        # --- 各パターンの保存 ---
+        patterns = [
+            ("headless", 2),
+            ("eyes", 1),
+            ("two_wide_rects", 1)
+        ]
+
+        for p_name, class_id in patterns:
+            out_img = headless_img.copy()
+            
+            if p_name == "eyes":
+                out_img[eye_mask == 255] = img_original[eye_mask == 255]
+            
+            elif p_name == "two_wide_rects":
+                restore_mask = head_mask.copy()
+                y_coords, x_coords = np.where(head_mask == 255)
+                # 代表的なBBox（最初の顔）を基準にサイズ決定
+                f_xmin, f_ymin, f_xmax, f_ymax = bboxes[0]
+                fw, fh = f_xmax - f_xmin, f_ymax - f_ymin
+                
+                for _ in range(2):
+                    idx = random.randint(0, len(x_coords) - 1)
+                    rx, ry = x_coords[idx], y_coords[idx]
+                    rw, rh = random.randint(int(fw*0.4), int(fw*0.7)), random.randint(int(fh*0.15), int(fh*0.3))
+                    cv2.rectangle(restore_mask, (rx-rw//2, ry-rh//2), (rx+rw//2, ry+rh//2), 0, -1)
+                
+                restore_mask = cv2.bitwise_and(restore_mask, head_mask)
+                out_img[restore_mask == 255] = img_original[restore_mask == 255]
+
+            # 画像とアノテーションの保存
+            sname = f"{base_name}_{p_name}"
+            cv2.imencode(ext, out_img)[1].tofile(os.path.join(OUTPUT_DIR, sname + ext))
+            
+            # 移植した正確なBBoxでYOLO保存 (複数顔対応)
+            # ※YOLOは1ファイルに複数行書けるため、appendモードで全顔分書き出し
+            with open(os.path.join(OUTPUT_DIR, sname + ".txt"), "w") as f:
+                for box in bboxes:
+                    xmin, ymin, xmax, ymax = box
+                    bw, bh = xmax - xmin, ymax - ymin
+                    if bw <= 0 or bh <= 0: continue
+                    xc, yc = xmin + bw/2.0, ymin + bh/2.0
+                    f.write(f"{class_id} {xc/w_img:.6f} {yc/h_img:.6f} {bw/w_img:.6f} {bh/h_img:.6f}\n")
 
         print(f"完了: {filename}")
     else:
-        print(f"スキップ: {filename} (顔が検出されませんでした)")
-
-print("\nすべての処理が終了しました。outputフォルダを確認してください。")
+        print(f"スキップ: {filename}")
